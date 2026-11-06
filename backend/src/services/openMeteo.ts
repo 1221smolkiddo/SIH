@@ -36,12 +36,12 @@ function describeWeatherCode(code: number): string {
   return WMO_CODES[code] ?? `Unknown weather code ${code}`;
 }
 
-async function fetchJson(url: string, attempts = 2): Promise<any | null> {
+async function fetchJson(url: string, attempts = 2, headers?: Record<string, string>): Promise<any | null> {
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 12_000);
     try {
-      const response = await fetch(url, { signal: controller.signal });
+      const response = await fetch(url, { signal: controller.signal, headers });
       if (!response.ok) {
         if (response.status >= 500 && attempt < attempts) continue;
         return null;
@@ -59,11 +59,46 @@ async function fetchJson(url: string, attempts = 2): Promise<any | null> {
   return null;
 }
 
+/**
+ * Geocode a location name using a multi-provider fallback strategy:
+ * 1. Open-Meteo geocoding (fast, no country pre-filter)
+ * 2. Nominatim / OpenStreetMap (hyperlocal — finds neighbourhoods, localities)
+ *
+ * Country validation is performed AFTER coordinates are found, never before.
+ */
 export async function geocodeLocation(name: string): Promise<GeoLocation | null> {
-  const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(name)}&count=1&language=en&countryCode=IN`;
-  const result = (await fetchJson(url))?.results?.[0];
-  if (!result) return null;
-  return { lat: result.latitude, lng: result.longitude, name: result.name, admin1: result.admin1, country: result.country };
+  const query = name.trim();
+  if (query.length < 2) return null;
+
+  // ── Provider 1: Open-Meteo geocoding (no country restriction so it can find any name) ──
+  const omUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(query)}&count=3&language=en`;
+  const omData = await fetchJson(omUrl);
+  if (omData?.results?.length) {
+    // Prefer Indian results first, then take whatever is top
+    const indian = (omData.results as any[]).find((r: any) => r.country_code?.toLowerCase() === "in");
+    const best = indian ?? omData.results[0];
+    if (best) {
+      return { lat: best.latitude, lng: best.longitude, name: best.name, admin1: best.admin1, country: best.country };
+    }
+  }
+
+  // ── Provider 2: Nominatim / OpenStreetMap (handles hyperlocal: LB Nagar, Gachibowli, etc.) ──
+  const nominatimUrl = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&countrycodes=in&format=json&limit=1&addressdetails=1`;
+  const nominatimData = await fetchJson(nominatimUrl, 2, { "User-Agent": "AEGIS-WeatherGPT/1.0 (disaster-response-platform)" });
+  if (nominatimData?.length) {
+    const r = nominatimData[0];
+    const lat = parseFloat(r.lat);
+    const lng = parseFloat(r.lon);
+    if (Number.isFinite(lat) && Number.isFinite(lng)) {
+      const displayParts = (r.display_name as string).split(",").map((s: string) => s.trim());
+      const placeName = displayParts[0];
+      const admin1 = displayParts.find((p: string) => /Pradesh|Maharashtra|Karnataka|Tamil|Bengal|Telangana|Gujarat|Rajasthan|Delhi|Bihar|Assam|Odisha/i.test(p));
+      const country = r.address?.country ?? "India";
+      return { lat, lng, name: placeName, admin1, country };
+    }
+  }
+
+  return null;
 }
 
 export async function fetchWeather(

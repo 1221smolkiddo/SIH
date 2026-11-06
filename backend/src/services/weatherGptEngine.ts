@@ -154,6 +154,11 @@ export function detectLanguage(
   return "en-IN";
 }
 
+/**
+ * Extract a location name from a natural language weather query.
+ * No hardcoded place lists — pure NLP regex patterns.
+ * The geocoder handles all place resolution.
+ */
 function extractLocation(message: string): string | null {
   const lower = message.toLocaleLowerCase();
   for (const location of LOCATIONS) {

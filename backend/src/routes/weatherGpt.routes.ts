@@ -78,13 +78,13 @@ async function getOptionalLlmExplanation(
       ? "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
       : "https://openrouter.ai/api/v1/chat/completions";
   const apiKey = provider === "google" ? googleKey : openRouterKey;
-  const model =
-    provider === "google"
-      ? "gemini-2.5-flash"
-      : process.env.OPENROUTER_MODEL || "meta-llama/llama-3.1-70b-instruct";
+  const model = provider === "google"
+    ? "gemini-2.5-flash"
+    : process.env.OPENROUTER_MODEL || "inclusionai/ling-3.0-flash-fin:free";
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 10_000);
   try {
+    const langNames: Record<WeatherLanguage, string> = { "en-IN": "English", "hi-IN": "Hindi", "te-IN": "Telugu" };
     const response = await fetch(endpoint, {
       method: "POST",
       signal: controller.signal,
@@ -99,7 +99,7 @@ async function getOptionalLlmExplanation(
         messages: [
           {
             role: "system",
-            content: `Explain the supplied rule-based recommendation in one short sentence in ${language}. Use only the supplied evidence. Do not introduce any number, measurement, date, forecast claim, or new advice.`,
+            content: `Explain the supplied rule-based recommendation in one short sentence in ${langNames[language]}. Use only the supplied evidence. Do not introduce any number, measurement, date, forecast claim, or new advice.`,
           },
           {
             role: "user",
@@ -114,12 +114,8 @@ async function getOptionalLlmExplanation(
       data.choices?.[0]?.message?.content ?? "",
     ).trim();
     // Measurements and all factual values remain deterministic. Reject LLM text
-    // containing digits or measurement symbols rather than risking fabrication.
-    if (
-      !explanation ||
-      explanation.length > 400 ||
-      /[\d%°]/u.test(explanation)
-    ) {
+    // containing digit characters (0-9) to avoid hallucinated numbers.
+    if (!explanation || explanation.length > 400 || /\d/u.test(explanation)) {
       return { used: false, provider, explanation: null };
     }
     return { used: true, provider, explanation };
@@ -127,6 +123,51 @@ async function getOptionalLlmExplanation(
     return { used: false, provider, explanation: null };
   } finally {
     clearTimeout(timeoutId);
+  }
+}
+
+async function extractLocationWithLlm(message: string): Promise<string | null> {
+  const googleKey = process.env.GOOGLE_API_KEY;
+  const openRouterKey = process.env.OPENROUTER_API_KEY;
+  const provider = googleKey ? "google" : openRouterKey ? "openrouter" : null;
+  if (!provider) return null;
+
+  const endpoint = provider === "google"
+    ? "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+    : "https://openrouter.ai/api/v1/chat/completions";
+  const apiKey = provider === "google" ? googleKey : openRouterKey;
+  const model = provider === "google"
+    ? "gemini-2.5-flash"
+    : process.env.OPENROUTER_MODEL || "inclusionai/ling-3.0-flash-fin:free";
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 6_000);
+    const response = await fetch(endpoint, {
+      method: "POST",
+      signal: controller.signal,
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model,
+        temperature: 0,
+        max_tokens: 30,
+        messages: [
+          {
+            role: "system",
+            content: "Extract the location (district, village, town, city, state) from the user's weather question. Output ONLY the location name in English script. If no location is present, output NONE.",
+          },
+          { role: "user", content: message },
+        ],
+      }),
+    });
+    clearTimeout(timeoutId);
+    if (!response.ok) return null;
+    const data = await response.json();
+    const result = String(data.choices?.[0]?.message?.content ?? "").trim();
+    if (!result || result.toUpperCase() === "NONE" || result.length > 50) return null;
+    return result;
+  } catch {
+    return null;
   }
 }
 
@@ -138,14 +179,6 @@ router.post("/chat", async (req, res) => {
   }
 
   const intent = parseWeatherIntent(message, language);
-  if (!intent.locationQuery) {
-    res.status(422).json({
-      error: MESSAGES[intent.language].location,
-      code: "LOCATION_REQUIRED",
-      language: intent.language,
-    });
-    return;
-  }
 
   const forcedFailure =
     process.env.WEATHERGPT_FORCE_PROVIDER_FAILURE === "true" ||
@@ -160,11 +193,20 @@ router.post("/chat", async (req, res) => {
   }
 
   try {
-    const weather = await getWeatherByLocation(intent.locationQuery, "gfs");
+    let weather = intent.locationQuery ? await getWeatherByLocation(intent.locationQuery, "gfs") : null;
+
+    // Fallback: If primary regex query failed, try LLM location extraction
     if (!weather) {
-      res.status(503).json({
-        error: MESSAGES[intent.language].unavailable,
-        code: "WEATHER_UNAVAILABLE",
+      const llmLocation = await extractLocationWithLlm(message);
+      if (llmLocation) {
+        weather = await getWeatherByLocation(llmLocation, "gfs");
+      }
+    }
+
+    if (!weather) {
+      res.status(422).json({
+        error: MESSAGES[intent.language].location,
+        code: "LOCATION_REQUIRED",
         language: intent.language,
       });
       return;
